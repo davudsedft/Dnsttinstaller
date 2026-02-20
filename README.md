@@ -15,7 +15,11 @@
 
 
 git clone https://github.com/davudsedft/Dnsttinstaller.git
+
 cd Dnsttinstaller
+
 sudo chmod +x dnstt-setup.sh
+
 sudo chmod +x dnstt-server
+
 bash dnstt-setup.sh
