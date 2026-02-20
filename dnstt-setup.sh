@@ -9,6 +9,7 @@ fi
 WORKDIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_NAME="dnstt-server"
 BIN_PATH="${WORKDIR}/${BIN_NAME}"
+CONFIG_FILE="${WORKDIR}/dnstt.conf"
 
 IPT_SERVICE="dnstt-iptables.service"
 DNSTT_SERVICE="dnstt.service"
@@ -19,13 +20,22 @@ echo " DNSTT Manager"
 echo "=============================="
 echo "1) Install DNSTT"
 echo "2) Remove DNSTT"
+echo "3) Show DNS Link"
 echo
-read -rp "Select option [1-2]: " ACTION
+read -rp "Select option [1-3]: " ACTION
 
 ############################################
 # REMOVE
 ############################################
 remove_dnstt() {
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "❌ DNSTT not installed"
+    exit 1
+  fi
+
+  source "$CONFIG_FILE"
+
   echo "[*] Stopping services..."
   systemctl stop dnstt ssh-socks dnstt-iptables 2>/dev/null || true
   systemctl disable dnstt ssh-socks dnstt-iptables 2>/dev/null || true
@@ -34,34 +44,59 @@ remove_dnstt() {
   rm -f /etc/systemd/system/${IPT_SERVICE}
   rm -f /etc/systemd/system/${DNSTT_SERVICE}
   rm -f /etc/systemd/system/${SSH_SERVICE}
-
   systemctl daemon-reload
 
   echo "[*] Cleaning iptables rules..."
-  iptables -D INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-  iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT 2>/dev/null || true
+  iptables -D INPUT -p udp --dport ${DNSTT_PORT} -j ACCEPT 2>/dev/null || true
+  iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports ${DNSTT_PORT} 2>/dev/null || true
 
-  echo "[*] Removing DNSTT files..."
+  echo "[*] Removing files..."
   rm -f "${WORKDIR}/server.key" "${WORKDIR}/server.pub"
+  rm -f "$CONFIG_FILE"
 
   echo
   echo "✅ DNSTT removed successfully"
 }
 
 ############################################
-# INSTALL
+# GENERATE DNS LINK
 ############################################
-install_dnstt() {
-  echo "[*] Working directory: $WORKDIR"
+generate_dns_link() {
 
-  # بررسی باینری
-  if [[ ! -x "$BIN_PATH" ]]; then
-    echo "❌ dnstt-server not found or not executable:"
-    echo "   $WORKDIR"
+  source "$CONFIG_FILE"
+
+  if [[ ! -f "${WORKDIR}/server.pub" ]]; then
+    echo "❌ Public key not found"
     exit 1
   fi
 
-  # ورودی‌ها
+  PUBKEY_HEX=$(tr -d '\n' < server.pub)
+  FIXED_PORT=6666
+  FIXED_DNS="1.1.1.1:53"
+  PROTO="udp"
+
+  DNS_RAW="${DOMAIN}&${PUBKEY_HEX}&${FIXED_PORT}&${FIXED_DNS}&${PROTO}"
+  DNS_BASE64=$(echo -n "$DNS_RAW" | base64 -w0)
+  DNS_LINK="dns://${DNS_BASE64}"
+
+  echo "$DNS_LINK"
+}
+
+############################################
+# INSTALL
+############################################
+install_dnstt() {
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    echo "❌ DNSTT already installed"
+    exit 1
+  fi
+
+  if [[ ! -x "$BIN_PATH" ]]; then
+    echo "❌ dnstt-server not found or not executable"
+    exit 1
+  fi
+
   read -rp "DNSTT domain (e.g. t.example.com): " DOMAIN
   read -rp "DNSTT UDP port (default 5300): " DNSTT_PORT
   DNSTT_PORT=${DNSTT_PORT:-5300}
@@ -70,14 +105,12 @@ install_dnstt() {
 
   cd "$WORKDIR"
 
-  # ساخت کلیدهای dnstt
   if [[ ! -f server.key ]]; then
     echo "[*] Generating DNSTT keys"
     chmod +x "$BIN_PATH"
     "$BIN_PATH" -gen-key -privkey-file server.key -pubkey-file server.pub
   fi
 
-  # ---------------- SSH key (localhost) ----------------
   if [[ ! -f /root/.ssh/id_ed25519 ]]; then
     echo "[*] Generating SSH key"
     mkdir -p /root/.ssh
@@ -85,13 +118,19 @@ install_dnstt() {
     cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
   fi
 
-  # permission صحیح SSH
   chmod 700 /root/.ssh
   chmod 600 /root/.ssh/id_ed25519
   chmod 600 /root/.ssh/authorized_keys
   chmod 644 /root/.ssh/id_ed25519.pub
 
-  # ---------------- iptables service ----------------
+  # Save config
+  cat > "$CONFIG_FILE" <<EOF
+DOMAIN=${DOMAIN}
+DNSTT_PORT=${DNSTT_PORT}
+SOCKS_PORT=${SOCKS_PORT}
+EOF
+
+  # IPTABLES SERVICE
   cat >/etc/systemd/system/${IPT_SERVICE} <<EOF
 [Unit]
 Description=DNSTT IPTables Rules
@@ -106,7 +145,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-  # ---------------- dnstt service ----------------
+  # DNSTT SERVICE
   cat >/etc/systemd/system/${DNSTT_SERVICE} <<EOF
 [Unit]
 Description=dnstt-server UDP tunnel
@@ -124,7 +163,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-  # ---------------- ssh socks service ----------------
+  # SSH SOCKS SERVICE
   cat >/etc/systemd/system/${SSH_SERVICE} <<EOF
 [Unit]
 Description=Local SSH SOCKS Proxy
@@ -133,43 +172,46 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/ssh \\
-  -o StrictHostKeyChecking=no \\
-  -o UserKnownHostsFile=/dev/null \\
-  -i /root/.ssh/id_ed25519 \\
-  -N -D 127.0.0.1:${SOCKS_PORT} 127.0.0.1
+ExecStart=/usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_ed25519 -N -D 127.0.0.1:${SOCKS_PORT} 127.0.0.1
 Restart=always
 RestartSec=5
-KillMode=process
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  # فعال‌سازی سرویس‌ها
   systemctl daemon-reload
   systemctl enable dnstt-iptables dnstt ssh-socks
   systemctl start dnstt-iptables dnstt ssh-socks
 
-  # ---------------- خروجی لینک DNS ----------------
-  PUBKEY_HEX=$(tr -d '\n' < server.pub)
-  FIXED_PORT=6666
-  FIXED_DNS="8.8.8.8:53"
-  PROTO="udp"
+  echo
+  echo "=============================="
+  echo "✅ DNSTT Installed Successfully"
+  echo "=============================="
+  echo
+  echo "Domain: $DOMAIN"
+  echo "SOCKS: socks5://127.0.0.1:${SOCKS_PORT}"
+  echo
+  echo "🔗 DNS LINK:"
+  generate_dns_link
+}
 
-  DNS_RAW="${DOMAIN}&${PUBKEY_HEX}&${FIXED_PORT}&${FIXED_DNS}&${PROTO}"
-  DNS_BASE64=$(echo -n "$DNS_RAW" | base64 -w0)
-  DNS_LINK="dns://${DNS_BASE64}"
+############################################
+# SHOW LINK
+############################################
+show_dns_link() {
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "❌ DNSTT not installed"
+    exit 1
+  fi
 
   echo
   echo "=============================="
-  echo "✅ DNSTT INSTALLED"
+  echo "🔗 DNS LINK"
   echo "=============================="
   echo
-  echo "Working directory: $WORKDIR"
-  echo "DNSTT domain: $DOMAIN"
-  echo "SOCKS proxy: socks5://127.0.0.1:${SOCKS_PORT}"
-  echo "DNS link: $DNS_LINK"
+  generate_dns_link
 }
 
 ############################################
@@ -177,5 +219,6 @@ EOF
 case "$ACTION" in
   1) install_dnstt ;;
   2) remove_dnstt ;;
+  3) show_dns_link ;;
   *) echo "❌ Invalid option"; exit 1 ;;
 esac
