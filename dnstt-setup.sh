@@ -102,6 +102,17 @@ install_dnstt() {
   DNSTT_PORT=${DNSTT_PORT:-5300}
   read -rp "SOCKS port (default 8000): " SOCKS_PORT
   SOCKS_PORT=${SOCKS_PORT:-8000}
+  
+  # Get SSH port from systemd or default to 22
+  SSH_PORT=$(ss -tlnp | grep -E 'sshd|ssh' | grep -oE ':[0-9]+' | head -1 | cut -d: -f2)
+  
+  # Alternative method if ss doesn't work
+  if [[ -z "$SSH_PORT" ]]; then
+    SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}')
+    SSH_PORT=${SSH_PORT:-22}
+  fi
+  
+  echo "[*] Detected SSH port: $SSH_PORT"
 
   cd "$WORKDIR"
 
@@ -128,6 +139,7 @@ install_dnstt() {
 DOMAIN=${DOMAIN}
 DNSTT_PORT=${DNSTT_PORT}
 SOCKS_PORT=${SOCKS_PORT}
+SSH_PORT=${SSH_PORT}
 EOF
 
   # IPTABLES SERVICE
@@ -163,7 +175,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-  # SSH SOCKS SERVICE
+  # SSH SOCKS SERVICE - Fixed to use correct SSH port
   cat >/etc/systemd/system/${SSH_SERVICE} <<EOF
 [Unit]
 Description=Local SSH SOCKS Proxy
@@ -172,7 +184,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_ed25519 -N -D 127.0.0.1:${SOCKS_PORT} 127.0.0.1
+ExecStart=/usr/bin/ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_ed25519 -N -D 127.0.0.1:${SOCKS_PORT} 127.0.0.1
 Restart=always
 RestartSec=5
 
@@ -191,6 +203,7 @@ EOF
   echo
   echo "Domain: $DOMAIN"
   echo "SOCKS: socks5://127.0.0.1:${SOCKS_PORT}"
+  echo "SSH Port: ${SSH_PORT}"
   echo
   echo "🔗 DNS LINK:"
   generate_dns_link
